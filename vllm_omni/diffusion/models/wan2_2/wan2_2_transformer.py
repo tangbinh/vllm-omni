@@ -28,6 +28,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelInput,
     SequenceParallelOutput,
 )
+from vllm_omni.diffusion.distributed.sp_sharding import sp_gather, sp_shard
 from vllm_omni.diffusion.forward_context import get_forward_context
 
 logger = init_logger(__name__)
@@ -684,6 +685,73 @@ class WanTransformerBlock(nn.Module):
         return hidden_states
 
 
+class VaceWanTransformerBlock(WanTransformerBlock):
+    """VACE variant of WanTransformerBlock with proj_in/proj_out for skip connections.
+
+    Matches diffusers' WanVACETransformerBlock behavior:
+    - Takes hidden_states (main latents, CONSTANT) and control_hidden_states (VACE state, MUTABLE)
+    - Returns (conditioning_states, control_hidden_states) tuple
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        ffn_dim: int,
+        num_heads: int,
+        eps: float = 1e-6,
+        added_kv_proj_dim: int | None = None,
+        cross_attn_norm: bool = False,
+        block_id: int = 0,
+    ):
+        super().__init__(dim, ffn_dim, num_heads, eps, added_kv_proj_dim, cross_attn_norm)
+        self.block_id = block_id
+        self.proj_in = nn.Linear(dim, dim) if block_id == 0 else None
+        self.proj_out = nn.Linear(dim, dim)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        control_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        hidden_states_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass for VACE block matching diffusers behavior.
+
+        Args:
+            hidden_states: Main latent states (constant across all VACE blocks)
+            encoder_hidden_states: Text embeddings
+            control_hidden_states: VACE embeddings (updated sequentially through blocks)
+            temb: Timestep embeddings
+            rotary_emb: Rotary position embeddings
+            hidden_states_mask: Optional attention mask
+
+        Returns:
+            conditioning_states: Hint for main transformer blocks (from proj_out)
+            control_hidden_states: Updated state for next VACE block
+        """
+        # First block: project and add main hidden_states
+        if self.proj_in is not None:
+            control_hidden_states = self.proj_in(control_hidden_states)
+            control_hidden_states = control_hidden_states + hidden_states
+
+        # Process control_hidden_states through attention and FFN (parent's forward logic)
+        control_hidden_states = super().forward(
+            control_hidden_states,
+            encoder_hidden_states,
+            temb,
+            rotary_emb,
+            hidden_states_mask,
+        )
+
+        # Generate conditioning hint from the updated control_hidden_states
+        conditioning_states = self.proj_out(control_hidden_states)
+
+        # Return both the hint and the updated state for next block
+        return conditioning_states, control_hidden_states
+
+
 class WanTransformer3DModel(nn.Module):
     """
     Optimized Wan Transformer model for video generation using vLLM layers.
@@ -847,6 +915,12 @@ class WanTransformer3DModel(nn.Module):
             ]
         )
 
+        # 3b. VACE blocks (optional, initialized via init_vace() when VACE checkpoint is present)
+        self.vace_blocks: nn.ModuleList | None = None
+        self.vace_patch_embedding: nn.Module | None = None
+        self.vace_layers: list[int] | None = None
+        self.vace_layers_mapping: dict[int, int] | None = None
+
         # 4. Output norm & projection
         self.norm_out = FP32LayerNorm(inner_dim, eps, elementwise_affine=False)
         self.proj_out = nn.Linear(inner_dim, out_channels * math.prod(patch_size))
@@ -854,6 +928,209 @@ class WanTransformer3DModel(nn.Module):
         # SP helper modules
         self.timestep_proj_prepare = TimestepProjPrepare()
         self.output_scale_shift_prepare = OutputScaleShiftPrepare(inner_dim)
+
+    def init_vace(self, vace_layers: list[int], vace_in_channels: int | None = None) -> None:
+        """Initialize VACE blocks for conditional video generation.
+
+        Args:
+            vace_layers: Which main block indices get VACE hints.
+                        Should be evenly spaced to match checkpoint (e.g., [0, 5, 10, ...] for 14B).
+                        Typically computed by load_vace_weights() from the checkpoint.
+            vace_in_channels: Input channels for VACE patch embedding. Defaults to model's in_channels.
+        """
+        inner_dim = self.config.num_attention_heads * self.config.attention_head_dim
+        self.vace_layers = vace_layers
+        self.vace_layers_mapping = {layer_idx: vace_idx for vace_idx, layer_idx in enumerate(vace_layers)}
+
+        vace_in_channels = vace_in_channels or self.config.in_channels
+        self.vace_patch_embedding = nn.Conv3d(
+            vace_in_channels,
+            inner_dim,
+            kernel_size=self.config.patch_size,
+            stride=self.config.patch_size,
+        )
+        self.vace_blocks = nn.ModuleList(
+            [
+                VaceWanTransformerBlock(
+                    inner_dim,
+                    self.config.ffn_dim,
+                    self.config.num_attention_heads,
+                    self.config.eps,
+                    self.config.added_kv_proj_dim,
+                    self.config.cross_attn_norm,
+                    block_id=i,
+                )
+                for i in range(len(vace_layers))
+            ]
+        )
+
+    def load_vace_weights(
+        self,
+        vace_state: dict[str, torch.Tensor],
+        vace_layers: list[int] | None = None,
+    ) -> None:
+        """Initialize and load VACE from a state dict (e.g. from safetensors).
+
+        Args:
+            vace_state: State dict containing VACE weights
+            vace_layers: List of main transformer layer indices that have VACE blocks.
+                        If None, reads from config.vace_layers if available, otherwise
+                        auto-computes evenly spaced layers based on num_vace_blocks
+                        and the transformer's num_layers.
+        """
+        vace_in_ch = next(
+            (v.shape[1] for k, v in vace_state.items() if "vace_patch_embedding.weight" in k),
+            None,
+        )
+        num_vace_blocks = len(set(int(k.split(".")[1]) for k in vace_state if k.startswith("vace_blocks.")))
+
+        if vace_layers is None:
+            # First try to read from config (HuggingFace models include vace_layers)
+            config_vace_layers = getattr(self.config, "vace_layers", None)
+            if config_vace_layers is not None and len(config_vace_layers) == num_vace_blocks:
+                vace_layers = list(config_vace_layers)
+            else:
+                # Auto-compute evenly spaced layers
+                # e.g., for 8 VACE blocks and 40 transformer layers: [0, 5, 10, 15, 20, 25, 30, 35]
+                num_layers = self.config.num_layers
+                step = num_layers // num_vace_blocks
+                vace_layers = [i * step for i in range(num_vace_blocks)]
+
+        self.init_vace(vace_layers=vace_layers, vace_in_channels=vace_in_ch)
+        self.load_weights(list(vace_state.items()))
+        # Move VACE modules to the same device as the main transformer
+        # Note: For external launcher mode (torchrun), the caller should also call
+        # .to(device) on vace_blocks and vace_patch_embedding after this method
+        device = next(self.parameters()).device
+        self.vace_blocks.to(dtype=self.dtype, device=device)
+        self.vace_patch_embedding.to(dtype=self.dtype, device=device)
+
+    def embed_vace_context(
+        self,
+        vace_context: list[torch.Tensor],
+        seq_len: int,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute VACE patch embeddings from context tensors.
+
+        This can be called once and cached if the same context is used across multiple timesteps.
+
+        Args:
+            vace_context: List of VACE context tensors [C, T, H, W] (video latents or frames)
+            seq_len: Target sequence length for padding
+            dtype: Target dtype for embeddings
+
+        Returns:
+            Embedded context tensor [B, seq_len, dim]
+        """
+        # Patch-embed each context tensor
+        vace_embeds = []
+        for ctx_tensor in vace_context:
+            # ctx_tensor: [C, T, H, W] -> [1, C, T, H, W]
+            embedded = self.vace_patch_embedding(ctx_tensor.unsqueeze(0).to(dtype))
+            # [1, dim, t', h', w'] -> [1, seq, dim]
+            embedded = embedded.flatten(2).transpose(1, 2)
+            # Pad to target sequence length
+            if embedded.size(1) < seq_len:
+                padding = embedded.new_zeros(1, seq_len - embedded.size(1), embedded.size(2))
+                embedded = torch.cat([embedded, padding], dim=1)
+            vace_embeds.append(embedded)
+
+        # Concatenate along batch dimension
+        return torch.cat(vace_embeds, dim=0)
+
+    def forward_vace(
+        self,
+        hidden_states: torch.Tensor,
+        vace_context: list[torch.Tensor],
+        seq_len: int,
+        encoder_hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        vace_embeds: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """Run VACE blocks to produce per-layer hints.
+
+        Args:
+            hidden_states: Current latent hidden states [B, seq, dim] (may be sharded for SP)
+            vace_context: List of VACE context tensors from image_embeds
+            seq_len: Target sequence length for padding
+            encoder_hidden_states: Text embeddings for cross-attention
+            timestep_proj: Timestep projection for modulation
+            rotary_emb: RoPE embeddings (may be sharded for SP)
+            vace_embeds: Pre-computed VACE embeddings (optional, for caching)
+
+        Returns:
+            List of hint tensors, one per VACE block (sharded if SP is active).
+        """
+        from vllm_omni.diffusion.distributed.parallel_state import get_sequence_parallel_world_size
+        from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+
+        sp_size = get_sequence_parallel_world_size()
+        use_sp = sp_size > 1
+
+        # hidden_states is NOT sharded here (called before blocks.0's SP hook).
+        # Only rotary_emb is sharded (by rope's split_output hook).
+        # Gather rotary_emb to full sequence for VACE processing.
+        if use_sp:
+            rotary_emb = (sp_gather(rotary_emb[0], dim=1), sp_gather(rotary_emb[1], dim=1))
+
+        # Temporarily disable SP in attention layers for VACE blocks,
+        # since we're processing the full (un-sharded) sequence.
+        saved_sp_depth = 0
+        if use_sp and is_forward_context_available():
+            ctx = get_forward_context()
+            saved_sp_depth = ctx._sp_shard_depth
+            ctx._sp_shard_depth = 0
+
+        # Compute or use pre-computed VACE embeddings
+        if vace_embeds is None:
+            vace_embeds = self.embed_vace_context(vace_context, seq_len, hidden_states.dtype)
+
+        # Pad/truncate embeddings to match hidden_states sequence length
+        # For R2V, VACE context may have reference frames prepended (extra temporal tokens).
+        # We need to skip those extra tokens from the BEGINNING to align video frames.
+        if hidden_states.shape[1] != vace_embeds.shape[1]:
+            logger.debug(
+                "VACE seq_len mismatch: hidden_states=%d, vace_embeds=%d",
+                hidden_states.shape[1],
+                vace_embeds.shape[1],
+            )
+        if hidden_states.shape[1] > vace_embeds.shape[1]:
+            # VACE shorter than main: pad at end (T2V case)
+            pad_len = hidden_states.shape[1] - vace_embeds.shape[1]
+            padding = vace_embeds.new_zeros(hidden_states.shape[0], pad_len, vace_embeds.shape[2])
+            vace_embeds = torch.cat([vace_embeds, padding], dim=1)
+        elif vace_embeds.shape[1] > hidden_states.shape[1]:
+            # VACE longer than main: skip ref frames at beginning (R2V case)
+            # Reference frames are prepended, so we skip from the start
+            skip_len = vace_embeds.shape[1] - hidden_states.shape[1]
+            logger.debug("Skipping %d tokens from VACE embeds (ref frames)", skip_len)
+            vace_embeds = vace_embeds[:, skip_len:]
+
+        # Run VACE blocks to produce hints
+        hints = []
+        control_hidden_states = vace_embeds
+
+        for block in self.vace_blocks:
+            conditioning_states, control_hidden_states = block(
+                hidden_states,
+                encoder_hidden_states,
+                control_hidden_states,
+                timestep_proj,
+                rotary_emb,
+            )
+            hints.append(conditioning_states)
+
+        # Restore SP depth
+        if use_sp and is_forward_context_available():
+            get_forward_context()._sp_shard_depth = saved_sp_depth
+
+        # Shard hints for SP consistency with main blocks
+        if use_sp:
+            hints = [sp_shard(h, dim=1, validate=False) for h in hints]
+
+        return hints
 
     @property
     def dtype(self) -> torch.dtype:
@@ -868,6 +1145,9 @@ class WanTransformer3DModel(nn.Module):
         encoder_hidden_states_image: torch.Tensor | None = None,
         return_dict: bool = True,
         attention_kwargs: dict[str, Any] | None = None,
+        vace_context: list[torch.Tensor] | None = None,
+        vace_seq_len: int | None = None,
+        vace_context_scale: float = 1.0,
     ) -> torch.Tensor | Transformer2DModelOutput:
         batch_size, num_channels, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
@@ -924,9 +1204,25 @@ class WanTransformer3DModel(nn.Module):
         if hidden_states_mask is not None and hidden_states_mask.all():
             hidden_states_mask = None
 
+        # Compute VACE hints inside forward (same hidden_states used by main blocks)
+        vace_hints = None
+        if vace_context is not None and self.vace_blocks is not None:
+            vace_hints = self.forward_vace(
+                hidden_states,
+                vace_context,
+                vace_seq_len or hidden_states.shape[1],
+                encoder_hidden_states,
+                timestep_proj,
+                rotary_emb,
+            )
+
         # Transformer blocks
-        for block in self.blocks:
+        for i, block in enumerate(self.blocks):
             hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, hidden_states_mask)
+            # Apply VACE hints if available
+            if vace_hints is not None and self.vace_layers_mapping is not None and i in self.vace_layers_mapping:
+                vace_idx = self.vace_layers_mapping[i]
+                hidden_states = hidden_states + vace_hints[vace_idx] * vace_context_scale
 
         # Output norm, projection & unpatchify
         shift, scale = self.output_scale_shift_prepare(temb)
@@ -980,6 +1276,7 @@ class WanTransformer3DModel(nn.Module):
         # Remap scale_shift_table to new module location
         weight_name_remapping = {
             "scale_shift_table": "output_scale_shift_prepare.scale_shift_table",
+            "head.scale_shift_table": "output_scale_shift_prepare.scale_shift_table",
         }
 
         params_dict = dict(self.named_parameters())

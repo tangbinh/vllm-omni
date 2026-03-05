@@ -193,6 +193,12 @@ class OmniDiffusionSamplingParams:
     noise_pred: torch.Tensor | None = None
     image_latent: torch.Tensor | None = None
 
+    # VACE conditioning (VAE-encoded reference latents)
+    # vace_context contains the Video Condition Unit (VCU) latents for VACE models
+    vace_context: list[torch.Tensor] | None = None
+    vace_context_scale: float = 1.0
+    vace_context_seq_len: int | None = None
+
     # Latent dimensions
     height_latents: list[int] | int | None = None
     width_latents: list[int] | int | None = None

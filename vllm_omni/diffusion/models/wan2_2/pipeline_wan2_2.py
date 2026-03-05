@@ -113,15 +113,19 @@ def get_wan22_post_process_func(
 ):
     from diffusers.video_processor import VideoProcessor
 
+    # Capture output_type from config - engine calls without passing it
+    config_output_type = getattr(od_config, "output_type", "np")
     video_processor = VideoProcessor(vae_scale_factor=8)
 
     def post_process_func(
         video: torch.Tensor,
-        output_type: str = "np",
+        output_type: str | None = None,
     ):
-        if output_type == "latent":
+        # Use config output_type if not explicitly passed
+        effective_output_type = output_type if output_type is not None else config_output_type
+        if effective_output_type == "latent":
             return video
-        return video_processor.postprocess_video(video, output_type=output_type)
+        return video_processor.postprocess_video(video, output_type=effective_output_type)
 
     return post_process_func
 
@@ -269,7 +273,12 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             model, subfolder="text_encoder", torch_dtype=dtype, local_files_only=local_files_only
         ).to(self.device)
         self.vae = DistributedAutoencoderKLWan.from_pretrained(
-            model, subfolder="vae", torch_dtype=torch.float32, local_files_only=local_files_only
+            model,
+            subfolder="vae",
+            torch_dtype=torch.float32,
+            local_files_only=local_files_only,
+            use_slicing=od_config.vae_use_slicing,
+            use_tiling=od_config.vae_use_tiling,
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
@@ -340,8 +349,14 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         attention_kwargs: dict | None = None,
+        vace_data: list[dict] | None = None,
+        skip_latent_normalization: bool = False,
         **kwargs,
     ) -> DiffusionOutput:
+        # Use output_type from config if not explicitly passed
+        if output_type is None:
+            output_type = getattr(self.od_config, "output_type", "np")
+
         # Get parameters from request or arguments
         if len(req.prompts) > 1:
             raise ValueError(
@@ -351,6 +366,20 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
             prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
             negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+            # Treat empty string as None (allows prompt_embeds to be used instead)
+            if prompt == "":
+                prompt = None
+            # Extract embeddings and VACE data from prompt if not provided as kwargs
+            if not isinstance(req.prompts[0], str):
+                prompt_embeds = prompt_embeds if prompt_embeds is not None else req.prompts[0].get("prompt_embeds")
+                negative_prompt_embeds = (
+                    negative_prompt_embeds
+                    if negative_prompt_embeds is not None
+                    else req.prompts[0].get("negative_prompt_embeds")
+                )
+                additional_info = req.prompts[0].get("additional_information", {})
+                if additional_info:
+                    vace_data = vace_data if vace_data is not None else additional_info.get("vace_data")
         if prompt is None and prompt_embeds is None:
             raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
 
@@ -532,6 +561,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
         else:
             # T2V mode: standard latent preparation
             num_channels_latents = self.transformer_config.in_channels
+
             latents = self.prepare_latents(
                 batch_size=prompt_embeds.shape[0],
                 num_channels_latents=num_channels_latents,
@@ -549,7 +579,7 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
 
         # Denoising
         with self.progress_bar(total=len(timesteps)) as pbar:
-            for t in timesteps:
+            for step_idx, t in enumerate(timesteps):
                 self._current_timestep = t
 
                 # Select model based on timestep and boundary_ratio
@@ -597,6 +627,23 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                     latent_model_input = latents.to(dtype)
                     timestep = t.expand(latents.shape[0])
 
+                # Resolve VACE context for this timestep
+                active_vace_context = None
+                active_vace_seq_len = None
+                active_vace_scale = 1.0
+                if vace_data is not None and current_model.vace_blocks is not None:
+                    current_step_pct = t.item() / self.scheduler.config.num_train_timesteps
+                    for entry in vace_data:
+                        if entry["start"] <= current_step_pct <= entry["end"]:
+                            active_vace_context = entry["context"]
+                            active_vace_seq_len = entry.get("seq_len")
+                            scale = entry.get("scale", 1.0)
+                            if isinstance(scale, list):
+                                active_vace_scale = scale[min(step_idx, len(scale) - 1)]
+                            else:
+                                active_vace_scale = scale
+                            break
+
                 do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
                 # Prepare kwargs for positive and negative predictions
                 positive_kwargs = {
@@ -606,6 +653,9 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
                     "attention_kwargs": attention_kwargs,
                     "return_dict": False,
                     "current_model": current_model,
+                    "vace_context": active_vace_context,
+                    "vace_seq_len": active_vace_seq_len,
+                    "vace_context_scale": active_vace_scale,
                 }
                 if do_true_cfg:
                     negative_kwargs = {
@@ -648,15 +698,16 @@ class Wan22Pipeline(nn.Module, CFGParallelMixin, ProgressBarMixin):
             output = latents
         else:
             latents = latents.to(self.vae.dtype)
-            latents_mean = (
-                torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
-                .to(latents.device, latents.dtype)
-            )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
-            latents = latents / latents_std + latents_mean
+            if not skip_latent_normalization:
+                latents_mean = (
+                    torch.tensor(self.vae.config.latents_mean)
+                    .view(1, self.vae.config.z_dim, 1, 1, 1)
+                    .to(latents.device, latents.dtype)
+                )
+                latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                    1, self.vae.config.z_dim, 1, 1, 1
+                ).to(latents.device, latents.dtype)
+                latents = latents / latents_std + latents_mean
             output = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=output)
