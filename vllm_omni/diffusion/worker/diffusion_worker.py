@@ -84,19 +84,29 @@ class DiffusionWorker:
         logger.info(f"Worker {self.rank}: Initialization complete.")
 
     def init_device(self) -> None:
-        """Initialize the device and distributed environment."""
+        """Initialize the device and distributed environment.
+
+        Supports both local multiprocessing and distributed (Ray) execution:
+        - For local multiprocessing: Uses localhost and od_config.master_port
+        - For distributed (Ray): Respects existing MASTER_ADDR/MASTER_PORT env vars
+
+        The device is selected using local_rank to support CUDA_VISIBLE_DEVICES
+        remapping in Ray environments.
+        """
         world_size = self.od_config.num_gpus
         rank = self.rank
 
         # Set environment variables for distributed initialization
-        os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = str(self.od_config.master_port)
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = "localhost"
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = str(self.od_config.master_port)
         os.environ["LOCAL_RANK"] = str(self.local_rank)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
 
-        # Setup device
-        self.device = current_omni_platform.get_torch_device(rank)
+        # Setup device using local_rank for CUDA_VISIBLE_DEVICES compatibility
+        self.device = current_omni_platform.get_torch_device(self.local_rank)
         current_omni_platform.set_device(self.device)
 
         # Create vllm_config for parallel configuration
@@ -504,15 +514,18 @@ class WorkerWrapperBase:
         base_worker_class: type = DiffusionWorker,
         worker_extension_cls: str | None = None,
         custom_pipeline_args: dict[str, Any] | None = None,
+        rank: int | None = None,
     ):
         """
         Initialize WorkerWrapperBase with support for worker extensions.
 
         Args:
-            gpu_id: GPU device ID
+            gpu_id: GPU device ID (used as local_rank for device selection)
             od_config: OmniDiffusionConfig configuration
             worker_extension_cls: Optional qualified name of worker extension class
             custom_pipeline_args: Optional arguments for custom pipeline initialization
+            rank: Global rank in distributed setup. If None, uses gpu_id as rank
+                  (for single-node multiprocessing compatibility).
         """
         self.gpu_id = gpu_id
         self.od_config = od_config
@@ -526,7 +539,7 @@ class WorkerWrapperBase:
         # Create the actual worker instance
         self.worker = worker_class(
             local_rank=gpu_id,
-            rank=gpu_id,
+            rank=rank if rank is not None else gpu_id,
             od_config=od_config,
         )
 

@@ -340,6 +340,9 @@ class OmniDiffusionConfig:
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
 
+    # Ray executor configuration
+    ray_address: str | None = None  # Ray cluster address (e.g., "auto", "ray://host:port")
+
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None

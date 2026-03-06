@@ -208,8 +208,13 @@ class WanRotaryPosEmbed(nn.Module):
             self.attention_head_dim // 3,
         ]
 
-        freqs_cos = self.freqs_cos.split(split_sizes, dim=1)
-        freqs_sin = self.freqs_sin.split(split_sizes, dim=1)
+        # Ensure buffers are on the same device as hidden_states
+        # This handles cases where persistent=False buffers may not have been moved
+        freqs_cos_buf = self.freqs_cos.to(hidden_states.device)
+        freqs_sin_buf = self.freqs_sin.to(hidden_states.device)
+
+        freqs_cos = freqs_cos_buf.split(split_sizes, dim=1)
+        freqs_sin = freqs_sin_buf.split(split_sizes, dim=1)
 
         freqs_cos_f = freqs_cos[0][:ppf].view(ppf, 1, 1, -1).expand(ppf, pph, ppw, -1)
         freqs_cos_h = freqs_cos[1][:pph].view(1, pph, 1, -1).expand(ppf, pph, ppw, -1)
