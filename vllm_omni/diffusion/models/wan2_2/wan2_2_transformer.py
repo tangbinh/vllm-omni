@@ -1078,7 +1078,12 @@ class WanTransformer3DModel(nn.Module):
         # Only rotary_emb is sharded (by rope's split_output hook).
         # Gather rotary_emb to full sequence for VACE processing.
         if use_sp:
-            rotary_emb = (sp_gather(rotary_emb[0], dim=1), sp_gather(rotary_emb[1], dim=1))
+            # Ensure rotary_emb is on the correct device before NCCL collective ops
+            device = hidden_states.device
+            rotary_emb = (
+                sp_gather(rotary_emb[0].to(device), dim=1),
+                sp_gather(rotary_emb[1].to(device), dim=1),
+            )
 
         # Temporarily disable SP in attention layers for VACE blocks,
         # since we're processing the full (un-sharded) sequence.

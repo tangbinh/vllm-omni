@@ -36,6 +36,61 @@ from vllm_omni.diffusion.registry import initialize_model
 
 logger = init_logger(__name__)
 
+# Default cache directory for S3 models
+_S3_CACHE_DIR = Path(os.environ.get("MODEL_CACHE_DIR", "/tmp/model_cache"))
+
+
+def _ensure_local_model_from_s3(s3_uri: str, cache_dir: Path = _S3_CACHE_DIR) -> str:
+    """Download model from S3 to local cache if needed.
+
+    Uses file locking to coordinate downloads within a node - only one process
+    downloads while others wait. Different nodes download independently.
+
+    Args:
+        s3_uri: S3 URI (e.g., s3://bucket/path/to/model/).
+        cache_dir: Parent directory for the local cache.
+
+    Returns:
+        Local filesystem path to the model directory.
+    """
+    import fcntl
+    import subprocess
+    import time
+
+    local_dir = cache_dir / Path(s3_uri.rstrip("/")).name
+    marker = local_dir / ".download_complete"
+
+    # Fast path: already downloaded
+    if marker.exists():
+        logger.info("Using cached model at %s", local_dir)
+        return str(local_dir)
+
+    # Use file lock to coordinate download within a node
+    local_dir.mkdir(parents=True, exist_ok=True)
+    lock_file = local_dir / ".download_lock"
+
+    with open(lock_file, "w") as f:
+        try:
+            # Try to acquire exclusive lock (non-blocking)
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # Got the lock - check again if download is complete
+            if not marker.exists():
+                logger.info("Downloading model from %s to %s", s3_uri, local_dir)
+                s3_uri_with_slash = s3_uri.rstrip("/") + "/"
+                cmd = ["aws", "s3", "sync", "--no-progress", "--exclude", ".cache/*", s3_uri_with_slash, str(local_dir)]
+                subprocess.run(cmd, check=True)
+                marker.touch()
+                logger.info("Model download complete")
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except BlockingIOError:
+            # Another process has the lock - wait for download to complete
+            logger.info("Waiting for another process to download model...")
+            while not marker.exists():
+                time.sleep(2)
+            logger.info("Model ready at %s", local_dir)
+
+    return str(local_dir)
+
 
 def _natural_sort_key(filepath: str) -> list:
     """Natural sort key for filenames with numeric components, e.g.
@@ -258,6 +313,12 @@ class DiffusersPipelineLoader:
         custom_pipeline_name: str | None = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
+        # Handle S3 paths - download to local cache before loading
+        if od_config.model.startswith("s3://"):
+            from dataclasses import replace
+            local_path = _ensure_local_model_from_s3(od_config.model)
+            od_config = replace(od_config, model=local_path)
+
         target_device = torch.device(load_device)
         with set_default_torch_dtype(od_config.dtype):
             if od_config.parallel_config.use_hsdp:
