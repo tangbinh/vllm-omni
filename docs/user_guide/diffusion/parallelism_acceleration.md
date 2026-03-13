@@ -59,6 +59,7 @@ The following table shows which models are currently supported by parallelism me
 | Model | Model Identifier | Ulysses-SP | Ring-Attention | Tensor-Parallel | HSDP | VAE-Patch-Parallel |
 |-------|------------------|:----------:|:--------------:|:---------------:|:----:| :----:|
 | **Wan2.2** | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Wan2.1-VACE** | `Wan-AI/Wan2.1-VACE-14B-diffusers` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **LTX-2** | `Lightricks/LTX-2` | ✅ | ✅ | ✅ | ❌ | ❌ |
 
 ### Tensor Parallelism
