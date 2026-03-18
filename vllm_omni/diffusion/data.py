@@ -653,14 +653,16 @@ class DiffusionOutput:
 
     def to_cpu(self) -> "DiffusionOutput":
         """Move all tensors to CPU (e.g. before Ray serialization)."""
-        if self.output is not None:
+        if isinstance(self.output, torch.Tensor):
             self.output = self.output.cpu()
         if self.trajectory_timesteps is not None:
-            self.trajectory_timesteps = [t.cpu() for t in self.trajectory_timesteps]
-        if self.trajectory_latents is not None:
+            self.trajectory_timesteps = [
+                t.cpu() if isinstance(t, torch.Tensor) else t for t in self.trajectory_timesteps
+            ]
+        if isinstance(self.trajectory_latents, torch.Tensor):
             self.trajectory_latents = self.trajectory_latents.cpu()
         if self.trajectory_decoded is not None:
-            self.trajectory_decoded = [t.cpu() for t in self.trajectory_decoded]
+            self.trajectory_decoded = [t.cpu() if isinstance(t, torch.Tensor) else t for t in self.trajectory_decoded]
         for k, v in self.custom_output.items():
             if isinstance(v, torch.Tensor):
                 self.custom_output[k] = v.cpu()
