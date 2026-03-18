@@ -347,6 +347,9 @@ class OmniDiffusionConfig:
     distributed_executor_backend: str = "mp"
     nccl_port: int | None = None
 
+    # Ray executor configuration
+    ray_address: str | None = None  # Ray cluster address (e.g., "auto", "ray://host:port")
+
     # HuggingFace specific parameters
     trust_remote_code: bool = False
     revision: str | None = None
@@ -647,6 +650,21 @@ class DiffusionOutput:
 
     # logged duration of stages
     stage_durations: dict[str, float] = field(default_factory=dict)
+
+    def to_cpu(self) -> "DiffusionOutput":
+        """Move all tensors to CPU (e.g. before Ray serialization)."""
+        if self.output is not None:
+            self.output = self.output.cpu()
+        if self.trajectory_timesteps is not None:
+            self.trajectory_timesteps = [t.cpu() for t in self.trajectory_timesteps]
+        if self.trajectory_latents is not None:
+            self.trajectory_latents = self.trajectory_latents.cpu()
+        if self.trajectory_decoded is not None:
+            self.trajectory_decoded = [t.cpu() for t in self.trajectory_decoded]
+        for k, v in self.custom_output.items():
+            if isinstance(v, torch.Tensor):
+                self.custom_output[k] = v.cpu()
+        return self
 
 
 class AttentionBackendEnum(enum.Enum):
