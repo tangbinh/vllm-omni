@@ -106,8 +106,14 @@ class RayDiffusionWorkerWrapper:
 
 class RayDiffusionExecutor(DiffusionExecutor):
     def _init_executor(self) -> None:
+        if ray is None:
+            raise ImportError(
+                "Ray is required for the 'ray' distributed executor backend. Install it with: pip install ray[default]"
+            )
+
         self._closed = False
         self.workers: list[RayWorkerMetaData] = []
+        self._placement_group: PlacementGroup | None = None
 
         if not ray.is_initialized():
             ray_address = getattr(self.od_config, "ray_address", None)
@@ -118,8 +124,8 @@ class RayDiffusionExecutor(DiffusionExecutor):
                 logger.info("Initializing local Ray instance")
                 ray.init()
 
-        placement_group = self._create_placement_group()
-        self._init_workers_ray(placement_group)
+        self._placement_group = self._create_placement_group()
+        self._init_workers_ray(self._placement_group)
 
     def _create_placement_group(self) -> "PlacementGroup":
         num_gpus = self.od_config.num_gpus
@@ -272,6 +278,13 @@ class RayDiffusionExecutor(DiffusionExecutor):
             except Exception as e:
                 logger.warning(f"Failed to kill worker rank {meta.rank}: {e}")
         self.workers.clear()
+
+        if getattr(self, "_placement_group", None) is not None:
+            try:
+                ray.util.remove_placement_group(self._placement_group)
+            except Exception as e:
+                logger.warning(f"Failed to remove placement group: {e}")
+            self._placement_group = None
 
     def __del__(self):
         self.shutdown()
