@@ -50,12 +50,8 @@ def _generate(num_gpus: int, ulysses_degree: int = 1):
         m.close()
 
 
-@pytest.mark.diffusion
-@hardware_test(res={"cuda": "L4"}, num_cards={"cuda": 1})
-def test_ray_executor_single_gpu():
-    """Single GPU inference via Ray executor."""
-    outputs = _generate(num_gpus=1)
-
+def _assert_video_output(outputs):
+    """Validate T2V output shape and type."""
     first_output = outputs[0]
     assert first_output.final_output_type == "image"
     assert first_output.request_output
@@ -71,21 +67,17 @@ def test_ray_executor_single_gpu():
 
 
 @pytest.mark.diffusion
+@pytest.mark.advanced_model
+@hardware_test(res={"cuda": "L4"}, num_cards={"cuda": 1})
+def test_ray_executor_single_gpu():
+    """Single GPU inference via Ray executor."""
+    _assert_video_output(_generate(num_gpus=1))
+
+
+@pytest.mark.diffusion
+@pytest.mark.advanced_model
 @pytest.mark.parallel
 @hardware_test(res={"cuda": "L4"}, num_cards={"cuda": 2})
 def test_ray_executor_parallel_ulysses():
     """Multi-GPU inference via Ray executor with Ulysses SP."""
-    outputs = _generate(num_gpus=2, ulysses_degree=2)
-
-    first_output = outputs[0]
-    assert first_output.final_output_type == "image"
-    assert first_output.request_output
-
-    req_out = first_output.request_output
-    assert isinstance(req_out, OmniRequestOutput)
-
-    frames = req_out.images[0]
-    assert frames is not None
-    assert frames.shape[1] == NUM_FRAMES
-    assert frames.shape[2] == HEIGHT
-    assert frames.shape[3] == WIDTH
+    _assert_video_output(_generate(num_gpus=2, ulysses_degree=2))
